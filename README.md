@@ -208,7 +208,16 @@ Sign up: https://rowmonitor.com/signup?utm_source=runcheck&utm_medium=readme
 
 ## Live Airflow check
 
-CI runs lint and unit tests. It does not start Airflow. On a machine with Docker, `scripts/e2e/run_airflow.sh` starts the official `apache/airflow:2.10.5` and `apache/airflow:3.4.0` images with `airflow standalone`, triggers `runcheck_ok` and `runcheck_fail`, and runs this CLI in `--dry-run` and against `scripts/e2e/webhook_catcher.py`. Override the images with `AIRFLOW2_IMAGE` and `AIRFLOW3_IMAGE`.
+Pull requests run `scripts/e2e/run_airflow.sh` on GitHub-hosted runners, which have Docker. The matrix is the official `apache/airflow:2.10.5` and `apache/airflow:3.4.0` images, each started with `airflow standalone`. The script triggers `runcheck_ok` and `runcheck_fail`, then checks this CLI: the failing DAG exits 1 and names that DAG, the passing DAG exits 0, a wrong password reports an authentication failure, and a stopped server reports the API as unreachable. It also posts once to a local webhook catcher and checks that a second run is deduped. The same workflow runs `scripts/e2e/check_dbt_fixture.py` against `tests/fixtures/dbt/run_results.json`.
+
+Run the same Airflow check on your own machine with Docker:
+
+```bash
+pip install -e .
+bash scripts/e2e/run_airflow.sh
+```
+
+Override the images with `AIRFLOW2_IMAGE` and `AIRFLOW3_IMAGE`.
 
 ## Development
 

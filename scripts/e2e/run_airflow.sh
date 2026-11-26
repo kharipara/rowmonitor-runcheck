@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 # Live check of rowmonitor-runcheck against official Apache Airflow images.
 #
-# Starts Airflow standalone, triggers runcheck_ok and runcheck_fail, then runs
-# the CLI with --dry-run and against scripts/e2e/webhook_catcher.py.
+# Starts Airflow standalone, triggers runcheck_ok and runcheck_fail, then:
+#   - dry-run of both DAGs exits 1 and names the failing DAG
+#   - dry-run of the failing DAG alone exits 1 and names it
+#   - dry-run of the passing DAG alone exits 0
+#   - a live post to the local webhook catcher, then a deduped second run
+#   - a wrong password reports an authentication failure
+#   - a stopped server reports the API as unreachable
 #
-#   ./scripts/e2e/run_airflow.sh        # Airflow 2.10.5, then Airflow 3.4.0
-#   ./scripts/e2e/run_airflow.sh 2      # apache/airflow:2.10.5 only
-#   ./scripts/e2e/run_airflow.sh 3      # apache/airflow:3.4.0 only
+#   ./scripts/e2e/run_airflow.sh        # 2.10.5, then 3.4.0
+#   ./scripts/e2e/run_airflow.sh 2
+#   ./scripts/e2e/run_airflow.sh 3
 #
-# Requires Docker. This script is not part of CI.
+# Requires Docker. Pull requests run this via .github/workflows/e2e.yml.
 # Override images with AIRFLOW2_IMAGE and AIRFLOW3_IMAGE.
 set -euo pipefail
 
@@ -24,16 +29,17 @@ if ! command -v docker >/dev/null 2>&1; then
   echo "Docker is not available, so this live Airflow check cannot run." >&2
   exit 2
 fi
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "python3 is required." >&2
-  exit 2
-fi
-if ! python3 -c "import requests" >/dev/null 2>&1; then
-  echo "python3 cannot import requests. Install the package first: pip install -e ." >&2
-  exit 2
-fi
 
-CLI=(python3 -m rowmonitor_runcheck)
+if python3 -c "import requests" >/dev/null 2>&1; then
+  PY=(python3)
+elif python -c "import requests" >/dev/null 2>&1; then
+  PY=(python)
+else
+  echo "Install the package first so requests is importable: pip install -e ." >&2
+  exit 2
+fi
+CLI=("${PY[@]}" -m rowmonitor_runcheck)
+
 NAME=""
 CATCHER_PID=""
 
@@ -48,69 +54,114 @@ cleanup() {
     NAME=""
   fi
 }
-trap cleanup EXIT
+
+on_exit() {
+  local status=$?
+  if [ "$status" -ne 0 ] && [ -n "${NAME:-}" ]; then
+    echo "---- last 120 log lines from $NAME ----" >&2
+    docker logs --tail 120 "$NAME" 2>&1 \
+      | sed -E 's/([Pp]assword[^:]*:).*/\1 [redacted]/' >&2 || true
+  fi
+  cleanup
+}
+trap on_exit EXIT
+
+base_url() {
+  echo "http://127.0.0.1:${HOST_PORT}"
+}
 
 wait_http() {
   local url="$1"
-  local extra=()
-  if [ "$#" -gt 1 ]; then
-    extra=("${@:2}")
-  fi
+  shift || true
   local attempt
   for attempt in $(seq 1 90); do
-    if curl -sf "${extra[@]}" "$url" >/dev/null 2>&1; then
+    if curl -sf "$@" "$url" >/dev/null 2>&1; then
       return 0
     fi
     sleep 2
   done
   echo "timed out waiting for $url" >&2
-  docker logs --tail 50 "$NAME" >&2 || true
   return 1
 }
 
 trigger_and_wait() {
   local api="$1"
-  local auth_header=()
+  local -a auth_header=()
   if [ "$api" = "v1" ]; then
     auth_header=(-u "$AIRFLOW_USERNAME:$AIRFLOW_PASSWORD")
   else
     auth_header=(-H "Authorization: Bearer $AIRFLOW_TOKEN")
   fi
-  local logical dag
+  local logical dag attempt code
   logical="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   for dag in runcheck_ok runcheck_fail; do
-    local attempt
-    for attempt in $(seq 1 60); do
-      local code
+    code=""
+    for attempt in $(seq 1 90); do
       code="$(curl -s -o /tmp/runcheck-dag.json -w "%{http_code}" \
         "${auth_header[@]}" \
-        -X PATCH "http://127.0.0.1:${HOST_PORT}/api/${api}/dags/${dag}" \
+        -X PATCH "$(base_url)/api/${api}/dags/${dag}" \
         -H "Content-Type: application/json" \
-        -d '{"is_paused": false}')"
-      if [ "$code" = "200" ]; then
+        -d '{"is_paused": false}' || true)"
+      if [ "$code" = "200" ] || [ "$code" = "204" ]; then
         break
+      fi
+      if [ $((attempt % 10)) -eq 0 ]; then
+        echo "still waiting for DAG $dag (HTTP ${code:-none})"
       fi
       sleep 2
     done
-    if [ "$code" != "200" ]; then
-      echo "DAG $dag was not found (HTTP $code). Is the DAG folder mounted?" >&2
+    if [ "$code" != "200" ] && [ "$code" != "204" ]; then
+      echo "DAG $dag was not found (HTTP ${code:-none})." >&2
       cat /tmp/runcheck-dag.json >&2 || true
       return 1
     fi
-    curl -sf "${auth_header[@]}" \
-      -X POST "http://127.0.0.1:${HOST_PORT}/api/${api}/dags/${dag}/dagRuns" \
+    local trigger_body="/tmp/runcheck-trigger-${dag}.json"
+    local trigger_code
+    trigger_code="$(curl -s -o "$trigger_body" -w "%{http_code}" \
+      "${auth_header[@]}" \
+      -X POST "$(base_url)/api/${api}/dags/${dag}/dagRuns" \
       -H "Content-Type: application/json" \
-      -d "{\"logical_date\": \"${logical}\"}" >/dev/null
+      -d "{\"logical_date\": \"${logical}\"}" || true)"
+    if [ "$trigger_code" != "200" ] && [ "$trigger_code" != "201" ]; then
+      echo "trigger $dag failed (HTTP ${trigger_code:-none})" >&2
+      cat "$trigger_body" >&2 || true
+      return 1
+    fi
+    echo "triggered $dag"
   done
+
   for dag in runcheck_ok runcheck_fail; do
-    local state=""
-    local attempt
-    for attempt in $(seq 1 90); do
-      state="$(curl -sf "${auth_header[@]}" \
-        "http://127.0.0.1:${HOST_PORT}/api/${api}/dags/${dag}/dagRuns?limit=1&order_by=-start_date" \
-        | python3 -c 'import json,sys; runs=json.load(sys.stdin).get("dag_runs") or []; print(runs[0]["state"] if runs else "")')"
+    local state="" attempt
+    for attempt in $(seq 1 120); do
+      state="$("${PY[@]}" - "$api" "$dag" "$(base_url)" <<'PY' || true
+import json, sys, urllib.request
+api, dag, base = sys.argv[1:]
+url = f"{base}/api/{api}/dags/{dag}/dagRuns?limit=5&order_by=-start_date"
+request = urllib.request.Request(url)
+user = __import__("os").environ.get("AIRFLOW_USERNAME", "")
+password = __import__("os").environ.get("AIRFLOW_PASSWORD", "")
+token = __import__("os").environ.get("AIRFLOW_TOKEN", "")
+if api == "v1":
+    import base64
+    basic = base64.b64encode(f"{user}:{password}".encode()).decode()
+    request.add_header("Authorization", f"Basic {basic}")
+else:
+    request.add_header("Authorization", f"Bearer {token}")
+try:
+    with urllib.request.urlopen(request, timeout=20) as response:
+        payload = json.load(response)
+except Exception:
+    print("")
+    raise SystemExit(0)
+runs = payload.get("dag_runs") or []
+print(runs[0].get("state", "") if runs else "")
+PY
+)"
       if [ "$state" = "success" ] || [ "$state" = "failed" ]; then
         break
+      fi
+      if [ $((attempt % 10)) -eq 0 ]; then
+        echo "still waiting for $dag (state ${state:-none})"
       fi
       sleep 2
     done
@@ -124,69 +175,148 @@ trigger_and_wait() {
   done
 }
 
-run_cli_checks() {
-  local api_flag="$1"
-  local out="$2"
-  local hooks="$3"
+run_cli() {
+  # Usage: run_cli <outfile> <errfile> -- airflow-args...
+  local out="$1"
+  local err="$2"
+  shift 2
+  if [ "${1:-}" != "--" ]; then
+    echo "run_cli internal error" >&2
+    return 2
+  fi
+  shift
   set +e
   AIRFLOW_USERNAME="${AIRFLOW_USERNAME:-}" \
   AIRFLOW_PASSWORD="${AIRFLOW_PASSWORD:-}" \
   AIRFLOW_TOKEN="${AIRFLOW_TOKEN:-}" \
-    "${CLI[@]}" airflow \
-      --url "http://127.0.0.1:${HOST_PORT}" \
-      --api-version "$api_flag" \
-      --dag runcheck_ok \
-      --dag runcheck_fail \
-      --max-age 26h \
-      --dry-run \
-      >"$out"
-  local dry=$?
+    "${CLI[@]}" airflow "$@" >"$out" 2>"$err"
+  local code=$?
   set -e
-  if [ "$dry" -ne 1 ]; then
-    echo "dry-run exit $dry, expected 1" >&2
-    cat "$out" >&2
-    return 1
-  fi
-  python3 - "$out" <<'PY'
+  return "$code"
+}
+
+assert_fail_payload() {
+  local out="$1"
+  "${PY[@]}" - "$out" <<'PY'
 import json
 import sys
 
 document = json.load(open(sys.argv[1], encoding="utf-8"))
-codes = {}
-for problem in document["preview"]["problems"]:
-    codes.setdefault(problem.get("dag_id"), []).append(problem["code"])
-if "latest_failed" not in codes.get("runcheck_fail", []):
-    raise SystemExit(f"failing DAG was not reported: {codes}")
-if "latest_failed" in codes.get("runcheck_ok", []):
-    raise SystemExit(f"passing DAG was reported as failed: {codes}")
-print("dry-run ok:", {dag: items for dag, items in codes.items()})
+problems = document["preview"]["problems"]
+failed = [item for item in problems if item.get("dag_id") == "runcheck_fail" and item.get("code") == "latest_failed"]
+if not failed:
+    raise SystemExit(f"failing DAG was not named in the payload: {problems}")
+ok_failed = [item for item in problems if item.get("dag_id") == "runcheck_ok" and item.get("code") == "latest_failed"]
+if ok_failed:
+    raise SystemExit(f"passing DAG was reported as failed: {problems}")
+text = json.dumps(document)
+if "runcheck_fail" not in text:
+    raise SystemExit("payload text did not name runcheck_fail")
+print("e2e: runcheck_fail named in payload")
+PY
+}
+
+run_cli_checks() {
+  local api_flag="$1"
+  local out hooks
+  out="$(mktemp)"
+  hooks="$(mktemp)"
+  local err
+  err="$(mktemp)"
+  local dry=0
+  run_cli "$out" "$err" -- \
+    --url "$(base_url)" \
+    --api-version "$api_flag" \
+    --dag runcheck_ok \
+    --dag runcheck_fail \
+    --max-age 26h \
+    --dry-run \
+    || dry=$?
+  if [ "$dry" -ne 1 ]; then
+    echo "combined dry-run exit $dry, expected 1" >&2
+    cat "$out" "$err" >&2
+    return 1
+  fi
+  assert_fail_payload "$out"
+  echo "e2e: both DAGs dry-run exit 1"
+
+  dry=0
+  run_cli "$out" "$err" -- \
+    --url "$(base_url)" \
+    --api-version "$api_flag" \
+    --dag runcheck_fail \
+    --max-age 26h \
+    --dry-run \
+    || dry=$?
+  if [ "$dry" -ne 1 ]; then
+    echo "failing DAG exit $dry, expected 1" >&2
+    cat "$out" "$err" >&2
+    return 1
+  fi
+  assert_fail_payload "$out"
+  echo "e2e: runcheck_fail exit 1"
+
+  dry=0
+  run_cli "$out" "$err" -- \
+    --url "$(base_url)" \
+    --api-version "$api_flag" \
+    --dag runcheck_ok \
+    --max-age 26h \
+    --dry-run \
+    || dry=$?
+  if [ "$dry" -ne 0 ]; then
+    echo "passing DAG exit $dry, expected 0" >&2
+    cat "$out" "$err" >&2
+    return 1
+  fi
+  "${PY[@]}" - "$out" <<'PY'
+import json
+import sys
+
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+problems = document["preview"]["problems"]
+if document.get("ok") is not True or problems:
+    raise SystemExit(f"passing DAG payload was not clean: {document}")
+print("e2e: runcheck_ok exit 0")
 PY
 
   : >"$hooks"
-  python3 "$ROOT/scripts/e2e/webhook_catcher.py" --port "$WEBHOOK_PORT" --out "$hooks" &
+  "${PY[@]}" "$ROOT/scripts/e2e/webhook_catcher.py" --port "$WEBHOOK_PORT" --out "$hooks" &
   CATCHER_PID=$!
-  sleep 0.5
+  local attempt
+  for attempt in $(seq 1 50); do
+    if "${PY[@]}" - "$WEBHOOK_PORT" <<'PY'
+import socket, sys
+port = int(sys.argv[1])
+try:
+    socket.create_connection(("127.0.0.1", port), 0.2).close()
+except OSError:
+    raise SystemExit(1)
+PY
+    then
+      break
+    fi
+    sleep 0.2
+  done
+
   local state="$out.state.json"
   rm -f "$state"
-  set +e
-  AIRFLOW_USERNAME="${AIRFLOW_USERNAME:-}" \
-  AIRFLOW_PASSWORD="${AIRFLOW_PASSWORD:-}" \
-  AIRFLOW_TOKEN="${AIRFLOW_TOKEN:-}" \
-    "${CLI[@]}" airflow \
-      --url "http://127.0.0.1:${HOST_PORT}" \
-      --api-version "$api_flag" \
-      --dag runcheck_ok \
-      --dag runcheck_fail \
-      --max-age 26h \
-      --webhook "http://127.0.0.1:${WEBHOOK_PORT}/hook" \
-      --state-file "$state"
-  local live=$?
-  set -e
+  local live=0
+  run_cli "$out" "$err" -- \
+    --url "$(base_url)" \
+    --api-version "$api_flag" \
+    --dag runcheck_ok \
+    --dag runcheck_fail \
+    --max-age 26h \
+    --webhook "http://127.0.0.1:${WEBHOOK_PORT}/hook" \
+    --state-file "$state" \
+    || live=$?
   if [ "$live" -ne 1 ]; then
-    echo "live exit $live, expected 1" >&2
+    echo "live webhook exit $live, expected 1" >&2
+    cat "$out" "$err" >&2
     return 1
   fi
-  python3 - "$hooks" <<'PY'
+  "${PY[@]}" - "$hooks" <<'PY'
 import json
 import sys
 
@@ -196,40 +326,89 @@ if len(lines) != 1:
 body = json.loads(lines[0])
 if body.get("check") != "airflow" or body.get("ok") is not False:
     raise SystemExit(f"unexpected webhook body: {body}")
-failed = [item for item in body["problems"] if item.get("dag_id") == "runcheck_fail" and item["code"] == "latest_failed"]
+failed = [
+    item for item in body["problems"]
+    if item.get("dag_id") == "runcheck_fail" and item.get("code") == "latest_failed"
+]
 if not failed:
-    raise SystemExit("webhook did not include the failing DAG")
-print("webhook ok")
+    raise SystemExit("webhook did not name runcheck_fail")
+print("e2e: webhook catcher received runcheck_fail latest_failed")
 PY
-  # The same failure must not be posted a second time.
-  set +e
-  AIRFLOW_USERNAME="${AIRFLOW_USERNAME:-}" \
-  AIRFLOW_PASSWORD="${AIRFLOW_PASSWORD:-}" \
-  AIRFLOW_TOKEN="${AIRFLOW_TOKEN:-}" \
-    "${CLI[@]}" airflow \
-      --url "http://127.0.0.1:${HOST_PORT}" \
-      --api-version "$api_flag" \
-      --dag runcheck_ok \
-      --dag runcheck_fail \
-      --max-age 26h \
-      --webhook "http://127.0.0.1:${WEBHOOK_PORT}/hook" \
-      --state-file "$state"
-  local again=$?
-  set -e
-  if [ "$again" -ne 1 ]; then
-    echo "deduped run exit $again, expected 1" >&2
+
+  live=0
+  run_cli "$out" "$err" -- \
+    --url "$(base_url)" \
+    --api-version "$api_flag" \
+    --dag runcheck_ok \
+    --dag runcheck_fail \
+    --max-age 26h \
+    --webhook "http://127.0.0.1:${WEBHOOK_PORT}/hook" \
+    --state-file "$state" \
+    || live=$?
+  if [ "$live" -ne 1 ]; then
+    echo "deduped run exit $live, expected 1" >&2
+    cat "$out" "$err" >&2
     return 1
   fi
-  python3 - "$hooks" <<'PY'
+  "${PY[@]}" - "$hooks" <<'PY'
 import sys
 lines = [line for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
 if len(lines) != 1:
     raise SystemExit(f"dedupe posted again; webhook lines={len(lines)}")
-print("dedupe ok")
+print("e2e: dedupe suppressed the second webhook")
 PY
   kill "$CATCHER_PID" >/dev/null 2>&1 || true
   wait "$CATCHER_PID" 2>/dev/null || true
   CATCHER_PID=""
+
+  local saved_password="${AIRFLOW_PASSWORD:-}"
+  AIRFLOW_PASSWORD="definitely-wrong"
+  AIRFLOW_TOKEN=""
+  local auth=0
+  run_cli "$out" "$err" -- \
+    --url "$(base_url)" \
+    --api-version "$api_flag" \
+    --dag runcheck_ok \
+    --timeout 20 \
+    || auth=$?
+  AIRFLOW_PASSWORD="$saved_password"
+  if [ "$auth" -ne 1 ]; then
+    echo "wrong password exit $auth, expected 1" >&2
+    cat "$out" "$err" >&2
+    return 1
+  fi
+  if ! grep -q "Airflow authentication failed" "$out" "$err"; then
+    echo "wrong password did not report an auth error" >&2
+    cat "$out" "$err" >&2
+    return 1
+  fi
+  if grep -q "definitely-wrong" "$out" "$err"; then
+    echo "wrong password was written to the output" >&2
+    return 1
+  fi
+  echo "e2e: wrong password -> Airflow authentication failed"
+
+  echo "stopping $NAME"
+  docker stop "$NAME" >/dev/null
+  AIRFLOW_TOKEN=""
+  local down=0
+  run_cli "$out" "$err" -- \
+    --url "$(base_url)" \
+    --api-version "$api_flag" \
+    --dag runcheck_ok \
+    --timeout 5 \
+    || down=$?
+  if [ "$down" -ne 1 ]; then
+    echo "stopped server exit $down, expected 1" >&2
+    cat "$out" "$err" >&2
+    return 1
+  fi
+  if ! grep -q "Airflow API unreachable" "$out" "$err"; then
+    echo "stopped server did not report unreachable" >&2
+    cat "$out" "$err" >&2
+    return 1
+  fi
+  echo "e2e: stopped server -> Airflow API unreachable"
 }
 
 run_airflow_2() {
@@ -243,7 +422,7 @@ run_airflow_2() {
     -e AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth \
     "$AIRFLOW2_IMAGE" standalone >/dev/null
   local attempt password=""
-  for attempt in $(seq 1 60); do
+  for attempt in $(seq 1 90); do
     if docker exec "$NAME" test -s /opt/airflow/standalone_admin_password.txt; then
       password="$(docker exec "$NAME" cat /opt/airflow/standalone_admin_password.txt | tr -d '[:space:]')"
       break
@@ -252,21 +431,15 @@ run_airflow_2() {
   done
   if [ -z "$password" ]; then
     echo "Airflow 2 did not write standalone_admin_password.txt" >&2
-    docker logs --tail 40 "$NAME" >&2 || true
     return 1
   fi
   export AIRFLOW_USERNAME=admin
   export AIRFLOW_PASSWORD="$password"
   unset AIRFLOW_TOKEN || true
-  wait_http "http://127.0.0.1:${HOST_PORT}/health"
+  wait_http "$(base_url)/health"
   trigger_and_wait v1
-  local out
-  out="$(mktemp)"
-  run_cli_checks v1 "$out" "$(mktemp)"
-  echo "Airflow 2.10 check passed ($AIRFLOW2_IMAGE)"
-  docker rm -f "$NAME" >/dev/null
-  NAME=""
-  unset AIRFLOW_PASSWORD
+  run_cli_checks v1
+  echo "e2e: Airflow 2.10.5 passed ($AIRFLOW2_IMAGE)"
 }
 
 run_airflow_3() {
@@ -288,21 +461,23 @@ run_airflow_3() {
   export AIRFLOW_USERNAME=admin
   export AIRFLOW_PASSWORD=admin
   unset AIRFLOW_TOKEN || true
-  wait_http "http://127.0.0.1:${HOST_PORT}/api/v2/version"
-  local token
-  token="$(curl -sf -X POST "http://127.0.0.1:${HOST_PORT}/auth/token" \
+  wait_http "$(base_url)/api/v2/version"
+  local token_body="/tmp/runcheck-token.json"
+  local token_code
+  token_code="$(curl -s -o "$token_body" -w "%{http_code}" \
+    -X POST "$(base_url)/auth/token" \
     -H "Content-Type: application/json" \
-    -d '{"username":"admin","password":"admin"}' \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')"
-  export AIRFLOW_TOKEN="$token"
+    -d '{"username":"admin","password":"admin"}' || true)"
+  if [ "$token_code" != "200" ] && [ "$token_code" != "201" ]; then
+    echo "Airflow 3 token request failed (HTTP ${token_code:-none})" >&2
+    cat "$token_body" >&2 || true
+    return 1
+  fi
+  AIRFLOW_TOKEN="$("${PY[@]}" -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["access_token"])' "$token_body")"
+  export AIRFLOW_TOKEN
   trigger_and_wait v2
-  local out
-  out="$(mktemp)"
-  run_cli_checks v2 "$out" "$(mktemp)"
-  echo "Airflow 3.x check passed ($AIRFLOW3_IMAGE)"
-  docker rm -f "$NAME" >/dev/null
-  NAME=""
-  unset AIRFLOW_TOKEN AIRFLOW_PASSWORD
+  run_cli_checks v2
+  echo "e2e: Airflow 3.4.0 passed ($AIRFLOW3_IMAGE)"
 }
 
 target="${1:-all}"
