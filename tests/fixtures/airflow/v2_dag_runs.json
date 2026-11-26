@@ -1,0 +1,30 @@
+{
+  "dag_runs": [
+    {
+      "dag_run_id": "manual__2026-11-24T00:00:00+00:00",
+      "dag_id": "orders_daily",
+      "logical_date": "2026-11-24T00:00:00Z",
+      "queued_at": "2026-11-24T00:00:01Z",
+      "start_date": "2026-11-24T00:00:02Z",
+      "end_date": "2026-11-24T00:05:00Z",
+      "duration": 298.0,
+      "data_interval_start": "2026-11-23T00:00:00Z",
+      "data_interval_end": "2026-11-24T00:00:00Z",
+      "run_after": "2026-11-24T00:00:00Z",
+      "last_scheduling_decision": "2026-11-24T00:00:02Z",
+      "run_type": "manual",
+      "state": "failed",
+      "triggered_by": "rest_api",
+      "triggering_user_name": "admin",
+      "conf": {},
+      "note": null,
+      "dag_versions": [],
+      "bundle_version": null,
+      "dag_display_name": "orders_daily",
+      "partition_key": null
+    }
+  ],
+  "total_entries": 1,
+  "next_cursor": null,
+  "previous_cursor": null
+}

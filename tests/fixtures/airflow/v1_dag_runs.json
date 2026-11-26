@@ -1,0 +1,21 @@
+{
+  "dag_runs": [
+    {
+      "dag_run_id": "scheduled__2026-11-24T00:00:00+00:00",
+      "dag_id": "orders_daily",
+      "logical_date": "2026-11-24T00:00:00+00:00",
+      "execution_date": "2026-11-24T00:00:00+00:00",
+      "start_date": "2026-11-24T00:00:02+00:00",
+      "end_date": "2026-11-24T00:12:00Z",
+      "data_interval_start": "2026-11-23T00:00:00+00:00",
+      "data_interval_end": "2026-11-24T00:00:00+00:00",
+      "last_scheduling_decision": "2026-11-24T00:00:02+00:00",
+      "run_type": "scheduled",
+      "state": "failed",
+      "external_trigger": false,
+      "conf": {},
+      "note": null
+    }
+  ],
+  "total_entries": 1
+}

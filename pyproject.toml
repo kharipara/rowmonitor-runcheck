@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rowmonitor-runcheck"
+version = "0.1.0"
+description = "Check the last Airflow DAG run or dbt Core invocation and send a short alert."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "kharipara" }]
+keywords = ["airflow", "dbt", "alerts"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Monitoring",
+]
+dependencies = ["requests>=2.31,<3"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "ruff>=0.6"]
+
+[project.urls]
+Homepage = "https://github.com/kharipara/rowmonitor-runcheck"
+Documentation = "https://github.com/kharipara/rowmonitor-runcheck#readme"
+Airflow = "https://rowmonitor.com/airflow?utm_source=runcheck&utm_medium=readme"
+Signup = "https://rowmonitor.com/signup?utm_source=runcheck&utm_medium=readme"
+
+[project.scripts]
+rowmonitor-runcheck = "rowmonitor_runcheck.cli:main"
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["rowmonitor_runcheck"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

@@ -1,0 +1,7 @@
+runcheck_fixture:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: target/fixture.duckdb
+      threads: 1

@@ -1,0 +1,29 @@
+# Manual PyPI publish. CI does not call this workflow.
+# Trigger it with workflow_dispatch only after an explicit decision to publish.
+name: Publish to PyPI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
